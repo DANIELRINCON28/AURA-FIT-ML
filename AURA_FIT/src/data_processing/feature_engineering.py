@@ -1,259 +1,174 @@
-"""
-src/data_processing/feature_engineering.py
-Modulo de creacion de caracteristicas y consolidacion del Master Feature Store.
-"""
-
-from __future__ import annotations
-
-import logging
-from pathlib import Path
-from typing import Dict
-
+import os
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from cleaning import DataCleaner
-from extraction import DataExtractor
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+def calcular_features_torniquetes(df_torniquetes: pd.DataFrame, fecha_corte: datetime) -> pd.DataFrame:
+    """
+    Calcula métricas de asistencia física y recencia a partir de los accesos por torniquete.
+    """
+    # 1. Asegurar formato de fecha en ingresos
+    df_torniquetes["fecha_hora_ingreso"] = pd.to_datetime(df_torniquetes["fecha_hora_ingreso"])
+    df_torniquetes["fecha_ingreso"] = df_torniquetes["fecha_hora_ingreso"].dt.date
+    df_torniquetes["hora_ingreso"] = df_torniquetes["fecha_hora_ingreso"].dt.hour
 
+    # Ventanas de análisis de 15 días
+    fecha_limite_15d = (fecha_corte - timedelta(days=15)).date()
+    fecha_limite_30d = (fecha_corte - timedelta(days=30)).date()
+    corte_date = fecha_corte.date()
 
-class FeatureEngineer:
-    """Construye y consolida el Master Feature Store centrado en clientes."""
+    metricas_socios = []
 
-    REQUIRED_SOURCES = {
-        "clientes",
-        "crean_aho_cte",
-        "crean_bolsillos",
-        "crean_fiducuenta",
-        "crean_inv_virtual_cdt",
-        "estimador_ing",
-        "invesbot",
-    }
+    for id_socio, grupo in df_torniquetes.groupby("id_socio"):
+        nombre = grupo["nombre_socio"].iloc[0]
+        sede = grupo["sede_frecuente"].iloc[0]
 
-    EXPECTED_MASTER_ROWS = 860_223
+        # Fechas extremas
+        primer_ingreso = grupo["fecha_hora_ingreso"].min().date()
+        ultimo_ingreso = grupo["fecha_hora_ingreso"].max().date()
 
-    def __init__(self, cleaned_dataframes: Dict[str, pd.DataFrame]):
-        """Inicializa el generador de features con la salida de DataCleaner."""
-        missing_sources = self.REQUIRED_SOURCES.difference(cleaned_dataframes.keys())
-        if missing_sources:
-            raise KeyError(
-                "Faltan fuentes requeridas para feature engineering: "
-                f"{sorted(missing_sources)}"
-            )
-        self.cleaned_dataframes = cleaned_dataframes
+        # Días sin asistencia y días de vinculación (SUP-06)
+        dias_sin_asistencia = (corte_date - ultimo_ingreso).days
+        dias_vinculado = max(1, (corte_date - primer_ingreso).days)
 
-    def build_master_feature_store(self) -> pd.DataFrame:
-        """Construye el DataFrame maestro con features y targets por cliente."""
-        logging.info("Iniciando construccion de Master Feature Store...")
-
-        df_master = self._build_client_base_features(self.cleaned_dataframes["clientes"])
-
-        agg_aho_cte = self._aggregate_crean_aho_cte(self.cleaned_dataframes["crean_aho_cte"])
-        agg_bolsillos = self._aggregate_crean_bolsillos(self.cleaned_dataframes["crean_bolsillos"])
-        agg_fiducuenta = self._aggregate_crean_fiducuenta(self.cleaned_dataframes["crean_fiducuenta"])
-        agg_invesbot = self._aggregate_invesbot(self.cleaned_dataframes["invesbot"])
-        agg_cdt = self._aggregate_crean_inv_virtual_cdt(
-            self.cleaned_dataframes["crean_inv_virtual_cdt"]
+        # Visitas únicas por día en cada ventana
+        visitas_unicas = grupo.drop_duplicates(subset=["fecha_ingreso"])
+        visitas_ultimos_15d = len(visitas_unicas[visitas_unicas["fecha_ingreso"] >= fecha_limite_15d])
+        visitas_previas_15d = len(
+            visitas_unicas[
+                (visitas_unicas["fecha_ingreso"] >= fecha_limite_30d) &
+                (visitas_unicas["fecha_ingreso"] < fecha_limite_15d)
+            ]
         )
 
-        # LEFT JOIN secuencial, preservando la entidad maestra de clientes (1 fila por numero_id).
-        for agg_df in [agg_aho_cte, agg_bolsillos, agg_fiducuenta, agg_invesbot, agg_cdt]:
-            df_master = df_master.merge(agg_df, on="numero_id", how="left", validate="one_to_one")
+        # Variación porcentual en 15 días
+        if visitas_previas_15d == 0:
+            var_asistencia_15d = 0.0 if visitas_ultimos_15d == 0 else 1.0
+        else:
+            var_asistencia_15d = (visitas_ultimos_15d - visitas_previas_15d) / visitas_previas_15d
 
-        continuous_product_features = [
-            "saldo_prom_liquidez",
-            "saldo_max_liquidez",
-            "cant_cuentas_aho",
-            "saldo_total_bolsillos",
-            "cant_bolsillos",
-            "saldo_prom_fiducuenta",
-            "saldo_prom_invesbot",
-            "saldo_prom_inv_cdt",
-            "saldo_max_inv_cdt",
-        ]
-        flag_features = [
-            "flag_tiene_aho",
-            "flag_tiene_bolsillos",
-            "flag_tiene_fiducuenta",
-            "flag_tiene_invesbot",
-            "flag_tiene_cdt",
-        ]
+        # Frecuencia mensual normalizada
+        total_visitas = len(visitas_unicas)
+        promedio_visitas_mensuales = round((total_visitas / dias_vinculado) * 30.0, 1)
 
-        df_master[continuous_product_features] = df_master[continuous_product_features].fillna(0.0)
-        df_master[flag_features] = df_master[flag_features].fillna(0).astype("int64")
+        # Última hora habitual de ingreso
+        ultima_hora_ingreso = int(grupo.sort_values("fecha_hora_ingreso").iloc[-1]["hora_ingreso"])
 
-        # Feature set avanzado para valor y propension.
-        df_master["num_productos_activos"] = (
-            df_master["flag_tiene_aho"]
-            + df_master["flag_tiene_bolsillos"]
-            + df_master["flag_tiene_fiducuenta"]
-            + df_master["flag_tiene_invesbot"]
-            + df_master["flag_tiene_cdt"]
-        )
-        df_master["saldo_total_inversiones"] = (
-            df_master["saldo_prom_fiducuenta"]
-            + df_master["saldo_prom_invesbot"]
-            + df_master["saldo_prom_inv_cdt"]
-        )
-        df_master["ratio_liquidez_vs_ingreso"] = (
-            df_master["saldo_prom_liquidez"] / (df_master["ingresos_mensuales"] + 1)
-        )
-        df_master["penetracion_bolsillos_vs_liquidez"] = (
-            df_master["saldo_total_bolsillos"] / (df_master["saldo_prom_liquidez"] + 1)
-        )
-        df_master["flag_superavit_operativo"] = (
-            df_master["ingresos_mensuales"] > (df_master["total_egresos_mensuales"] * 1.5)
-        ).astype("int64")
-        df_master["flag_propension_digital_previa"] = (
-            (df_master["flag_tiene_invesbot"] == 1) | (df_master["saldo_prom_inv_cdt"] > 0)
-        ).astype("int64")
+        # Target de Abandono (SUP-01: Churn marcado a los 21 días sin asistencia)
+        target_churn_90d = 1 if dias_sin_asistencia >= 21 else 0
 
-        # Targets de negocio para clasificacion (adopcion) y regresion (monto potencial 12M).
-        df_master["target_adopcion"] = (
-            (df_master["saldo_total_inversiones"] > 0) | (df_master["flag_tiene_invesbot"] == 1)
-        ).astype("int64")
-        excedente_liquidez = np.maximum(
-            0,
-            df_master["saldo_prom_liquidez"] - (df_master["total_egresos_mensuales"] * 2),
-        )
-        df_master["target_monto_12m"] = df_master["saldo_total_inversiones"] + excedente_liquidez
+        metricas_socios.append({
+            "id_socio": id_socio,
+            "nombre_socio": nombre,
+            "sede_frecuente": sede,
+            "dias_vinculado": dias_vinculado,
+            "dias_sin_asistencia": dias_sin_asistencia,
+            "var_asistencia_15d": round(float(var_asistencia_15d), 3),
+            "promedio_visitas_mensuales": promedio_visitas_mensuales,
+            "ultima_hora_ingreso": ultima_hora_ingreso,
+            "target_churn_90d": target_churn_90d
+        })
 
-        self._validate_master(df_master)
+    return pd.DataFrame(metricas_socios)
 
-        logging.info(
-            "Master Feature Store construido correctamente: %s filas | %s columnas | nulos totales=%s",
-            f"{len(df_master):,}",
-            f"{df_master.shape[1]:,}",
-            "0",
-        )
 
-        return df_master
+def aplicar_motor_reglas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica el sistema de alerta temprana basado en reglas e interpretabilidad:
+      - Riesgo Alto: >= 14 días sin ingreso O caída de visitas >= 50%
+      - Riesgo Medio: 7 a 13 días sin ingreso O caída entre 25% y 49%
+      - Riesgo Bajo: resto de socios
+    """
+    niveles = []
+    causas = []
+    prescripciones = []
 
-    @staticmethod
-    def _build_client_base_features(clientes_df: pd.DataFrame) -> pd.DataFrame:
-        """Calcula ratios financieros base sobre la entidad maestra clientes."""
-        df = clientes_df.copy()
+    for _, row in df.iterrows():
+        dias = row["dias_sin_asistencia"]
+        caida = row["var_asistencia_15d"]
+        cobro_fallido = row.get("cobro_fallido_reciente", 0)
 
-        df["margen_libre_estimado"] = (
-            df["ingresos_mensuales"] - df["total_egresos_mensuales"]
-        )
-        df["ratio_apalancamiento"] = df["total_pasivos"] / (df["total_activos"] + 1)
-        df["ratio_cobertura_egresos"] = (
-            df["total_activos"] / (df["total_egresos_mensuales"] * 12 + 1)
-        )
+        # 1. Evaluación de Riesgo Alto
+        if dias >= 14 or caida <= -0.50:
+            niveles.append("Alto")
+            if dias >= 14:
+                causas.append(f"Inasistencia prolongada ({int(dias)} días sin asistir)")
+                prescripciones.append("Llamada personalizada de bienvenida / reactivación")
+            else:
+                causas.append(f"Caída drástica de visitas ({abs(round(caida * 100))}% en 15d)")
+                prescripciones.append("Sesión VIP de cortesía / Rutina con entrenador")
 
-        return df
+        # 2. Evaluación de Riesgo Medio
+        elif (7 <= dias <= 13) or (-0.49 <= caida <= -0.25):
+            niveles.append("Medio")
+            if dias >= 7:
+                causas.append(f"Alerta temprana ({int(dias)} días sin asistir)")
+                prescripciones.append("Mensaje motivacional + Invitación a clase grupal")
+            else:
+                causas.append(f"Descenso moderado de ritmo ({abs(round(caida * 100))}%)")
+                prescripciones.append("Pase de cortesía para un acompañante")
 
-    @staticmethod
-    def _aggregate_crean_aho_cte(df: pd.DataFrame) -> pd.DataFrame:
-        """Agrega metricas de liquidez y bandera de posesion desde cuentas de ahorro/corriente."""
-        agg_df = (
-            df.groupby("numero_id", as_index=False)
-            .agg(
-                saldo_prom_liquidez=("saldo", "mean"),
-                saldo_max_liquidez=("saldo", "max"),
-                cant_cuentas_aho=("producto", "nunique"),
-            )
-            .copy()
-        )
-        agg_df["flag_tiene_aho"] = 1
-        return agg_df
+        # 3. Riesgo Bajo
+        else:
+            if cobro_fallido == 1:
+                niveles.append("Medio")
+                causas.append("Fricción en cobro de pasarela ERP")
+                prescripciones.append("Notificación de actualización de método de pago")
+            else:
+                niveles.append("Bajo")
+                causas.append("Comportamiento habitual y constante")
+                prescripciones.append("Fidelización estándar / Felicitación por constancia")
 
-    @staticmethod
-    def _aggregate_crean_bolsillos(df: pd.DataFrame) -> pd.DataFrame:
-        """Agrega metricas de bolsillos y bandera de posesion."""
-        agg_df = (
-            df.groupby("numero_id", as_index=False)
-            .agg(
-                saldo_total_bolsillos=("saldo", "mean"),
-                cant_bolsillos=("saldo", "count"),
-            )
-            .copy()
-        )
-        agg_df["flag_tiene_bolsillos"] = 1
-        return agg_df
+    df["nivel_riesgo_reglas"] = niveles
+    df["causa_raiz"] = causas
+    df["prescripcion_sugerida"] = prescripciones
 
-    @staticmethod
-    def _aggregate_crean_fiducuenta(df: pd.DataFrame) -> pd.DataFrame:
-        """Agrega saldo promedio de fiducuenta y su bandera de posesion."""
-        agg_df = (
-            df.groupby("numero_id", as_index=False)
-            .agg(saldo_prom_fiducuenta=("saldo", "mean"))
-            .copy()
-        )
-        agg_df["flag_tiene_fiducuenta"] = 1
-        return agg_df
+    # Flag de intervención operativa (SUP-03: Día 45 a 70)
+    df["en_ventana_intervencion"] = df["dias_vinculado"].between(45, 70)
 
-    @staticmethod
-    def _aggregate_invesbot(df: pd.DataFrame) -> pd.DataFrame:
-        """Agrega saldo promedio de invesbot y su bandera de posesion."""
-        agg_df = (
-            df.groupby("numero_id", as_index=False)
-            .agg(saldo_prom_invesbot=("saldo", "mean"))
-            .copy()
-        )
-        agg_df["flag_tiene_invesbot"] = 1
-        return agg_df
+    return df
 
-    @staticmethod
-    def _aggregate_crean_inv_virtual_cdt(df: pd.DataFrame) -> pd.DataFrame:
-        """Agrega saldo promedio/maximo de inversion CDT y su bandera de posesion."""
-        agg_df = (
-            df.groupby("numero_id", as_index=False)
-            .agg(
-                saldo_prom_inv_cdt=("saldo", "mean"),
-                saldo_max_inv_cdt=("saldo", "max"),
-            )
-            .copy()
-        )
-        agg_df["flag_tiene_cdt"] = 1
-        return agg_df
 
-    @classmethod
-    def _validate_master(cls, df_master: pd.DataFrame) -> None:
-        """Valida integridad minima del Feature Store: cardinalidad y nulos."""
-        if len(df_master) != cls.EXPECTED_MASTER_ROWS:
-            raise ValueError(
-                "El Master Feature Store no conserva la cardinalidad esperada de clientes. "
-                f"Esperado={cls.EXPECTED_MASTER_ROWS:,} | Actual={len(df_master):,}"
-            )
+def construir_master_features(fecha_corte_str: str = "2026-10-25") -> pd.DataFrame:
+    """
+    Orquesta la unificación de las 3 fuentes limpias, calcula variables analíticas
+    y exporta el archivo df_master_features.parquet en data/.
+    """
+    from extraction import extraer_datos_crudos
+    from cleaning import procesar_limpieza_completa
 
-        total_nulls = int(df_master.isna().sum().sum())
-        if total_nulls != 0:
-            raise ValueError(
-                "El Master Feature Store contiene nulos despues de la consolidacion. "
-                f"Nulos detectados={total_nulls:,}"
-            )
+    fecha_corte = datetime.strptime(fecha_corte_str, "%Y-%m-%d")
+
+    # 1. Extracción y Limpieza
+    t_raw, p_raw, a_raw = extraer_datos_crudos()
+    t_clean, p_clean, a_clean = procesar_limpieza_completa(t_raw, p_raw, a_raw)
+
+    # 2. Features de Torniquetes (Predictor Primario)
+    df_torniquetes_feat = calcular_features_torniquetes(t_clean, fecha_corte)
+
+    # 3. Merge con ERP (Pagos) y Mock (App)
+    df_master = df_torniquetes_feat.merge(p_clean, on="id_socio", how="left")
+    df_master = df_master.merge(a_clean, on="id_socio", how="left")
+
+    # 4. Asignación del motor de reglas analítico
+    df_master = aplicar_motor_reglas(df_master)
+
+    # 5. Persistencia en formato Parquet
+    ruta_salida = os.path.join(DATA_DIR, "df_master_features.parquet")
+    df_master.to_parquet(ruta_salida, index=False)
+
+    print(f"\n[FEATURE ENGINEERING] Master Table generada con éxito:")
+    print(f"  • Ubicación: {ruta_salida}")
+    print(f"  • Dimensiones: {df_master.shape[0]} socios x {df_master.shape[1]} columnas")
+    print(f"  • Tasa de Churn histórica (>=21 días): {df_master['target_churn_90d'].mean() * 100:.1f}%")
+    print(f"  • Socios en ventana de intervención (45-70d): {df_master['en_ventana_intervencion'].sum()}")
+
+    return df_master
 
 
 if __name__ == "__main__":
-    BASE_DIR = Path(__file__).resolve().parent.parent.parent
-    RAW_DATA_PATH = BASE_DIR / "data"
-    FEATURE_STORE_DIR = RAW_DATA_PATH / "feature_store"
-    FEATURE_STORE_PATH = FEATURE_STORE_DIR / "df_master.parquet"
-
-    logging.info("Buscando datos fuente en: %s", RAW_DATA_PATH)
-
-    extractor = DataExtractor(data_dir=RAW_DATA_PATH)
-    raw_dfs = extractor.extract_all_sources()
-
-    cleaner = DataCleaner(raw_dataframes=raw_dfs)
-    cleaned_dfs = cleaner.clean_all_sources()
-
-    engineer = FeatureEngineer(cleaned_dataframes=cleaned_dfs)
-    df_master = engineer.build_master_feature_store()
-
-    FEATURE_STORE_DIR.mkdir(parents=True, exist_ok=True)
-    df_master.to_parquet(FEATURE_STORE_PATH, index=False)
-
-    logging.info(
-        "Feature Store guardado en %s | filas=%s | columnas=%s",
-        FEATURE_STORE_PATH,
-        f"{len(df_master):,}",
-        f"{df_master.shape[1]:,}",
-    )
+    construir_master_features()

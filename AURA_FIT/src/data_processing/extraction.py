@@ -1,78 +1,56 @@
-"""
-src/data_processing/extract.py
-Módulo para la extracción modular y segura de bases de datos SQLite (.db) a DataFrames de Pandas.
-"""
-
-from pathlib import Path
-import logging
+import os
 import sqlite3
 import pandas as pd
 
-# Configuración de logs para trazabilidad en producción
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Rutas dinámicas
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 
-class DataExtractor:
-    """Clase encargada de conectar y extraer tablas desde archivos SQLite .db."""
+def ejecutar_script_sql(cursor: sqlite3.Cursor, ruta_archivo: str):
+    """Lee y ejecuta un script .sql en la sesión SQLite activa."""
+    if not os.path.exists(ruta_archivo):
+        raise FileNotFoundError(f"No se encontró el archivo: {ruta_archivo}")
+    
+    with open(ruta_archivo, "r", encoding="utf-8") as f:
+        script = f.read()
+    cursor.executescript(script)
 
-    def __init__(self, data_dir: Path):
-        self.data_dir = Path(data_dir)
-        if not self.data_dir.exists():
-            raise FileNotFoundError(f"El directorio especificado no existe: {self.data_dir.resolve()}")
 
-        # Mapeo de nombres lógicos a nombres de archivo .db
-        self.sources = {
-            "clientes": "clientes.db",
-            "crean_aho_cte": "crean_aho_cte.db",
-            "crean_bolsillos": "crean_bolsillos.db",
-            "crean_fiducuenta": "crean_fiducuenta.db",
-            "crean_inv_virtual_cdt": "crean_inv_virtual_cdt.db",
-            "estimador_ing": "estimador_ing.db",
-            "invesbot": "invesbot.db",
-        }
+def extraer_datos_crudos():
+    """
+    Ejecuta los scripts .sql en memoria y retorna 3 DataFrames crudos:
+      - df_torniquetes: marcas de acceso físico
+      - df_pagos: pasarela ERP y contratos
+      - df_app: métricas y uso digital de Aura App
+    """
+    conn = sqlite3.connect(":memory:")
+    cursor = conn.cursor()
 
-    def _get_table_name(self, conn: sqlite3.Connection) -> str:
-        """Obtiene dinámicamente el nombre de la tabla principal dentro del archivo .db."""
-        query = "SELECT name FROM sqlite_master WHERE type='table';"
-        tables = pd.read_sql_query(query, conn)
-        if tables.empty:
-            raise ValueError("No se encontraron tablas dentro de la base de datos.")
-        return tables.iloc[0, 0]
+    archivos = [
+        "01_torniquetes_iot.sql",
+        "02_pasarela_erp.sql",
+        "03_aura_app_logs.sql"
+    ]
 
-    def extract_single_table(self, source_key: str) -> pd.DataFrame:
-        """Extrae una fuente específica por su clave identificadora."""
-        if source_key not in self.sources:
-            raise KeyError(f"La clave '{source_key}' no está definida en las fuentes.")
+    for archivo in archivos:
+        ruta = os.path.join(DATA_DIR, archivo)
+        ejecutar_script_sql(cursor, ruta)
 
-        db_path = self.data_dir / self.sources[source_key]
-        if not db_path.exists():
-            raise FileNotFoundError(f"No se encontró el archivo SQLite: {db_path.resolve()}")
+    # Extracción a DataFrames
+    df_torniquetes = pd.read_sql_query("SELECT * FROM raw_torniquetes;", conn)
+    df_pagos = pd.read_sql_query("SELECT * FROM raw_pagos_erp;", conn)
+    df_app = pd.read_sql_query("SELECT * FROM raw_aura_app;", conn)
 
-        logging.info(f"Extrayendo tabla desde: {self.sources[source_key]}...")
-        with sqlite3.connect(db_path) as conn:
-            table_name = self._get_table_name(conn)
-            df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+    conn.close()
 
-        logging.info(f" -> '{source_key}' cargada exitosamente: {len(df):,} filas, {len(df.columns)} columnas.")
-        return df
+    print("[EXTRACTION] Extracción completada con éxito:")
+    print(f"  • Torniquetes crudos: {len(df_torniquetes):,} registros")
+    print(f"  • Pasarela Pagos:     {len(df_pagos):,} socios")
+    print(f"  • Aura App Logs:      {len(df_app):,} registros")
 
-    def extract_all_sources(self) -> dict[str, pd.DataFrame]:
-        """Extrae todas las 7 fuentes de datos y las retorna en un diccionario de DataFrames."""
-        logging.info("Iniciando extracción masiva de las 7 fuentes de datos...")
-        dataframes = {}
-        for key in self.sources.keys():
-            dataframes[key] = self.extract_single_table(key)
-        
-        logging.info("Extracción de todas las fuentes finalizada correctamente.")
-        return dataframes
+    return df_torniquetes, df_pagos, df_app
 
 
 if __name__ == "__main__":
-    # Resuelve la ruta 'data' ubicándola 2 niveles arriba respecto a la ubicación de este script (src/data_processing/)
-    BASE_DIR = Path(__file__).resolve().parent.parent.parent
-    RAW_DATA_PATH = BASE_DIR / "data"
-    
-    print(f"Buscando carpeta de datos en: {RAW_DATA_PATH}")
-    
-    extractor = DataExtractor(data_dir=RAW_DATA_PATH)
-    raw_dfs = extractor.extract_all_sources()
+    extraer_datos_crudos()
