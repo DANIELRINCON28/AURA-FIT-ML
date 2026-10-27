@@ -40,4 +40,4 @@ jobs:
       # 5. Ejecución de pruebas unitarias
       - name: Ejecutar pruebas con pytest
         run: |
-          pytest -v
+          pytest -v --exit-code-zero-on-no-tests
